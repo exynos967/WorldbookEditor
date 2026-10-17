@@ -8,6 +8,11 @@ import { API, setCharBindings, charSetAuxWorlds } from './api.js';
 import { UI } from './ui.js';
 import { logger } from './logger.js';
 
+// Token 计数缓存：内容变化时自动失效，避免渲染/输入时对世界书全文重复调用分词器。
+// 以 uid 为主键，整本重载后依然命中；无 uid 的条目退回 WeakMap 按对象引用缓存
+const tokenCountCacheByUid = new Map();
+const tokenCountCacheByRef = new WeakMap();
+
 export const Actions = {
     async flushPendingSave() {
         if (STATE.debouncer) {
@@ -49,7 +54,14 @@ export const Actions = {
         const et = event_types;
 
         es.on(et.SETTINGS_UPDATED, () => { if (document.getElementById(CONFIG.id)) this.refreshAllContext(); });
-        es.on(et.WORLDINFO_UPDATED, (name, data) => { if (STATE.currentBookName === name) this.loadBook(name); });
+        es.on(et.WORLDINFO_UPDATED, (name, data) => {
+            if (STATE.currentBookName !== name) return;
+            // 忽略插件自身保存触发的回环事件（防抖保存窗口内）：
+            // STATE.entries 已是最新数据，整本重载会全量重建 DOM、偷袭当前输入框焦点
+            const self = STATE.lastSelfSave;
+            if (self && self.name === name && Date.now() - self.at < 2000) return;
+            this.loadBook(name);
+        });
         es.on(et.CHAT_CHANGED, () => { if (document.getElementById(CONFIG.id)) this.refreshAllContext(); });
         es.on(et.CHARACTER_SELECTED, () => {
             setTimeout(() => {
@@ -338,10 +350,27 @@ export const Actions = {
     getTokenCount(text) {
         if (!text) return 0;
         try {
-            return getContext().getTokenCount(text); 
+            return getContext().getTokenCount(text);
         } catch (e) {
             return Math.ceil(text.length / 3);
         }
+    },
+
+    getEntryTokenCount(entry) {
+        if (!entry) return 0;
+        const content = entry.content || '';
+        const uid = entry.uid;
+        const useUid = uid !== undefined && uid !== null;
+        const cached = useUid ? tokenCountCacheByUid.get(uid) : tokenCountCacheByRef.get(entry);
+        if (cached && cached.content === content) return cached.count;
+        const count = this.getTokenCount(content);
+        if (useUid) {
+            if (tokenCountCacheByUid.size > 5000) tokenCountCacheByUid.clear();
+            tokenCountCacheByUid.set(uid, { content, count });
+        } else {
+            tokenCountCacheByRef.set(entry, { content, count });
+        }
+        return count;
     },
     
     getExistingGroups() {

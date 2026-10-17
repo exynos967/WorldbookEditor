@@ -41,6 +41,7 @@ export const STATE = {
     },
 
     debouncer: null,
+    lastSelfSave: null,
 
     boundBooksCacheVersion: 0,
     boundBooksCache: null

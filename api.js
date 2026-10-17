@@ -282,6 +282,8 @@ export const API = {
         });
 
         const newData = { ...oldData, entries: newEntriesObj };
+        // 记录保存事件，供 WORLDINFO_UPDATED 回环判断（saveWorldInfo 会广播该事件）
+        STATE.lastSelfSave = { name, at: Date.now() };
         await getContext().saveWorldInfo(name, newData, false);
     },
 

@@ -3778,3 +3778,13 @@ body[data-theme="dark"] #enhanced-wb-panel-v6 #wb-manage-content.mode-custom .wb
     -moz-appearance: textfield !important;
     appearance: textfield !important;
 }
+
+/* 长列表渲染优化：屏幕外的卡片跳过布局与绘制，大量条目时滚动/拖动更流畅 */
+#enhanced-wb-panel-v6 .wb-card {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 110px;
+}
+#enhanced-wb-panel-v6 .wb-manage-card {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 48px;
+}

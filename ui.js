@@ -16,6 +16,20 @@ export const UI = {
         };
     },
 
+    // document 级监听器清理注册表：绑定视图每次重渲染都会重建下拉组件，
+    // 其外部点击监听器必须先移除再重挂，否则每次渲染都会永久叠加一批监听器
+    _bindingViewCleanups: [],
+
+    _cleanupBindingView() {
+        this._bindingViewCleanups.forEach(fn => { try { fn(); } catch (_) {} });
+        this._bindingViewCleanups = [];
+    },
+
+    _addBindingDocClick(handler) {
+        document.addEventListener('click', handler);
+        this._bindingViewCleanups.push(() => document.removeEventListener('click', handler));
+    },
+
     updateGlider(tabName) {
         const glider = document.querySelector('.wb-tab-glider');
         const targetTab = document.querySelector(`.wb-tab[data-tab="${tabName}"]`);
@@ -172,20 +186,27 @@ export const UI = {
                     openDropdowns.forEach(el => el.classList.remove('show'));
                 } else {
                     // 没有子弹窗，关闭主面板
-                    const mainPanel = document.getElementById(CONFIG.id);
-                    if (mainPanel) {
-                        Actions.flushPendingSave().then(() => mainPanel.remove());
-                    }
+                    closePanel();
                 }
             }
         };
         document.addEventListener('keydown', escHandler);
 
-        $('#wb-close').onclick = async () => {
+        // 统一关闭入口：确保 document 级监听器和分帧任务全部清理，
+        // 避免反复打开面板导致的监听器累积泄漏
+        const closePanel = async () => {
             document.removeEventListener('keydown', escHandler);
+            if (this._panelOutsideClick) {
+                document.removeEventListener('click', this._panelOutsideClick);
+                this._panelOutsideClick = null;
+            }
+            if (this._dropdownInitRaf) { cancelAnimationFrame(this._dropdownInitRaf); this._dropdownInitRaf = null; }
+            this._cleanupBindingView();
             await Actions.flushPendingSave();
             panel.remove();
         };
+
+        $('#wb-close').onclick = closePanel;
         $$('.wb-tab').forEach(el => el.onclick = () => Actions.switchView(el.dataset.tab));
         $('#wb-book-selector').addEventListener('change', (e) => Actions.loadBook(e.target.value));
         $('#wb-search-entry').oninput = this.debounce((e) => this.renderList(e.target.value), 250);
@@ -237,10 +258,11 @@ export const UI = {
             };
         });
 
-        document.addEventListener('click', (e) => {
+        this._panelOutsideClick = (e) => {
             if (menuDropdown.classList.contains('show') && !menuTrigger.contains(e.target) && !menuDropdown.contains(e.target)) menuDropdown.classList.remove('show');
             if (analysisMenu.classList.contains('show') && !analysisBtn.contains(e.target) && !analysisMenu.contains(e.target)) analysisMenu.classList.remove('show');
-        });
+        };
+        document.addEventListener('click', this._panelOutsideClick);
 
         const fileInput = $('#wb-import-file');
         fileInput.onchange = (e) => {
@@ -441,6 +463,7 @@ export const UI = {
         const { char, global, chat } = STATE.bindings;
         const view = document.getElementById('wb-view-binding');
         if (!view) return;
+        this._cleanupBindingView();
 
         const createOpts = (selectedVal) => {
             let html = '<option value="">(无)</option>';
@@ -627,7 +650,7 @@ export const UI = {
                 }
             };
             inputEl.oninput = applyFilters;
-            document.addEventListener('click', (e) => { if (!dom.contains(e.target)) dropEl.classList.remove('show'); });
+            this._addBindingDocClick((e) => { if (!dom.contains(e.target)) dropEl.classList.remove('show'); });
             refresh();
         };
 
@@ -830,11 +853,34 @@ export const UI = {
         };
 
         inputEl.oninput = applyFilters;
-        document.addEventListener('click', (e) => {
+        this._addBindingDocClick((e) => {
             if (!dom.contains(e.target)) dropEl.classList.remove('show');
         });
 
         updateDisplay();
+    },
+
+    // 分批初始化条目卡片的自定义下拉：首批同步保证可见区域即时生效，
+    // 其余通过 rAF 分帧完成，避免长列表全量初始化阻塞主线程
+    initCardDropdowns() {
+        if (this._dropdownInitRaf) { cancelAnimationFrame(this._dropdownInitRaf); this._dropdownInitRaf = null; }
+        const uids = this._pendingDropdownUids = STATE.entries.map(e => e.uid);
+        const SYNC_COUNT = 30;
+        const CHUNK = 50;
+        for (let i = 0; i < Math.min(SYNC_COUNT, uids.length); i++) {
+            this.applyCustomDropdown(`wb-pos-${uids[i]}`);
+        }
+        let next = SYNC_COUNT;
+        const step = () => {
+            this._dropdownInitRaf = null;
+            if (this._pendingDropdownUids !== uids) return; // 列表已重建，终止旧的分帧任务
+            const end = Math.min(next + CHUNK, uids.length);
+            for (; next < end; next++) this.applyCustomDropdown(`wb-pos-${uids[next]}`);
+            if (next < uids.length) this._dropdownInitRaf = requestAnimationFrame(step);
+            else this._pendingDropdownUids = null;
+        };
+        if (next < uids.length) this._dropdownInitRaf = requestAnimationFrame(step);
+        else this._pendingDropdownUids = null;
     },
 
     updateHeaderInfo() {
@@ -872,7 +918,7 @@ export const UI = {
             let blueTokens = 0, greenTokens = 0;
             STATE.entries.forEach(entry => {
                 if (entry.disable === false) {
-                    const t = Actions.getTokenCount(entry.content);
+                    const t = Actions.getEntryTokenCount(entry);
                     if (entry.constant === true) blueTokens += t;
                     else greenTokens += t;
                 }
@@ -912,7 +958,7 @@ export const UI = {
         }
 
         const tokenEl = card.querySelector('.wb-token-display');
-        if (tokenEl) tokenEl.textContent = Actions.getTokenCount(entry.content);
+        if (tokenEl) tokenEl.textContent = Actions.getEntryTokenCount(entry);
         const warnContainer = card.querySelector('.wb-warning-container');
         if (warnContainer) {
             const showWarning = entry.disable === false && entry.constant === false && !(entry.key?.length > 0);
@@ -951,16 +997,14 @@ export const UI = {
         const isClearSearch = term === '';
 
         if (isFirstRender || isClearSearch) {
-            list.innerHTML = '';
+            // 使用 DocumentFragment 一次性挂载，避免逐卡片 appendChild 触发反复回流
+            const fragment = document.createDocumentFragment();
             STATE.entries.forEach((entry, index) => {
-                const card = this.createCard(entry, index);
-                // 添加可搜索的文本属性（包含所有可搜索内容）
-                const comment = entry.comment || '';
-                const content = entry.content || '';
-                card.dataset.searchText = `${comment} ${content}`.toLowerCase();
-                list.appendChild(card);
-                this.applyCustomDropdown(`wb-pos-${entry.uid}`);
+                fragment.appendChild(this.createCard(entry, index));
             });
+            list.innerHTML = '';
+            list.appendChild(fragment);
+            this.initCardDropdowns();
             return;
         }
 
@@ -1047,7 +1091,7 @@ export const UI = {
                 </div>
                 <!-- Token 显示 -->
                 <div class="wb-header-item wb-item-token">
-                    <div class="wb-input-dark wb-token-display" title="Tokens">${Actions.getTokenCount(entry.content)}</div>
+                    <div class="wb-input-dark wb-token-display" title="Tokens">${Actions.getEntryTokenCount(entry)}</div>
                 </div>
                 <!-- 预览和删除按钮 -->
                 <div class="wb-header-item wb-item-actions">
@@ -1719,16 +1763,24 @@ export const UI = {
             updateOrder();
         });
 
+        let dragoverRaf = null;
         listEl.addEventListener('dragover', (e) => {
-            e.preventDefault(); 
-            const dragging = listEl.querySelector('.pc-dragging');
-            if (!dragging) return;
-            const siblings = [...listEl.querySelectorAll('.wb-sort-item:not(.pc-dragging)')];
-            const next = siblings.find(s => {
-                const rect = s.getBoundingClientRect();
-                return e.clientY <= rect.top + rect.height / 2;
+            e.preventDefault();
+            // rAF 节流：拖拽过程中浏览器每个指针事件都触发 dragover，
+            // 全量 querySelectorAll + getBoundingClientRect 会阻塞主线程，合并到每帧一次
+            if (dragoverRaf) return;
+            const clientY = e.clientY;
+            dragoverRaf = requestAnimationFrame(() => {
+                dragoverRaf = null;
+                const dragging = listEl.querySelector('.pc-dragging');
+                if (!dragging) return;
+                const siblings = [...listEl.querySelectorAll('.wb-sort-item:not(.pc-dragging)')];
+                const next = siblings.find(s => {
+                    const rect = s.getBoundingClientRect();
+                    return clientY <= rect.top + rect.height / 2;
+                });
+                listEl.insertBefore(dragging, next);
             });
-            listEl.insertBefore(dragging, next);
         });
 
         let touchItem = null;
@@ -1832,7 +1884,7 @@ export const UI = {
             // 统计所有条目的tokens（用于右上角显示）
             let allEnabledTokens = 0, allDisabledTokens = 0;
             sourceEntries.forEach(entry => {
-                const t = Actions.getTokenCount(entry.content);
+                const t = Actions.getEntryTokenCount(entry);
                 if (entry.disable) { allDisabledTokens += t; } else { allEnabledTokens += t; }
             });
 
@@ -1840,7 +1892,7 @@ export const UI = {
             const rankList = [];
 
             targetEntries.forEach(entry => {
-                const t = Actions.getTokenCount(entry.content);
+                const t = Actions.getEntryTokenCount(entry);
                 const isBlue = !!entry.constant;
                 const isDisabled = !!entry.disable;
                 if (isBlue) { blueTokens += t; blueCount++; } else { greenTokens += t; greenCount++; }
